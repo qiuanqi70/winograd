@@ -1,4 +1,4 @@
-CC = nvcc
+CC = /usr/local/cuda/bin/nvcc
 CFLAGS = -O3 -std=c++17
 TARGET = winograd
 SOURCES = main.cu naive_conv.cu winograd_conv.cu

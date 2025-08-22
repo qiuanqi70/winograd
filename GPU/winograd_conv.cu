@@ -27,7 +27,44 @@ __constant__ float A_T[2][4] = {
     {0.0f, 1.0f, -1.0f, -1.0f}
 };
 
-// Fused kernel for Winograd convolution F(2x2, 3x3)
+// Kernel to precompute filter transformations
+__global__
+void filter_transform_kernel(const float* __restrict__ filter,
+                             float* __restrict__ U,
+                             int K, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_filters = K * C;
+    if (idx >= total_filters) return;
+    
+    int k = idx / C;
+    int c = idx % C;
+    
+    // Get pointer to the 3x3 filter for (k, c)
+    const float* g = filter + (k * C + c) * 9;
+    
+    // Get pointer to output 4x4 transformed filter
+    float* u_kc = U + (k * C + c) * 16;
+    
+    // Filter Transform: U = G * g * G^T
+    float temp_g[4][3];
+    
+    // First step: temp_g = G * g
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            temp_g[i][j] = G[i][0] * g[0 * 3 + j] + G[i][1] * g[1 * 3 + j] + G[i][2] * g[2 * 3 + j];
+        }
+    }
+    
+    // Second step: u_kc = temp_g * G^T (manually computed G^T multiplication)
+    for (int i = 0; i < 4; ++i) {
+        u_kc[i * 4 + 0] = temp_g[i][0];
+        u_kc[i * 4 + 1] = 0.5f * (temp_g[i][0] + temp_g[i][1] + temp_g[i][2]);
+        u_kc[i * 4 + 2] = 0.5f * (temp_g[i][0] - temp_g[i][1] + temp_g[i][2]);
+        u_kc[i * 4 + 3] = temp_g[i][2];
+    }
+}
+
+// Fused kernel for Winograd convolution F(2x2, 3x3) using precomputed filter transforms
 __global__
 void winograd_conv_kernel(const float* __restrict__ image,
                           const float* __restrict__ filter,
@@ -48,22 +85,10 @@ void winograd_conv_kernel(const float* __restrict__ image,
 
     // Loop over input channels
     for (int c = 0; c < C; ++c) {
-        // --- Filter Transform ---
-        const float* g = filter + (k * C + c) * 9;
-        float u_kc[4][4];
-        float temp_g[4][3];
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                temp_g[i][j] = G[i][0] * g[0 * 3 + j] + G[i][1] * g[1 * 3 + j] + G[i][2] * g[2 * 3 + j];
-            }
-        }
-        for (int i = 0; i < 4; ++i) {
-            u_kc[i][0] = temp_g[i][0];
-            u_kc[i][1] = 0.5f * (temp_g[i][0] + temp_g[i][1] + temp_g[i][2]);
-            u_kc[i][2] = 0.5f * (temp_g[i][0] - temp_g[i][1] + temp_g[i][2]);
-            u_kc[i][3] = temp_g[i][2];
-        }
-
+        // --- Load Precomputed Filter Transform ---
+        // Note: filter parameter now points to precomputed U matrix
+        const float* u_kc = filter + (k * C + c) * 16;
+        
         // --- Image Transform ---
         int h_start = tile_y * 2;
         int w_start = tile_x * 2;
@@ -89,7 +114,7 @@ void winograd_conv_kernel(const float* __restrict__ image,
         // --- Element-wise product and accumulate ---
         for (int i = 0; i < 4; ++i) {
             for (int j = 0; j < 4; ++j) {
-                m[i][j] += u_kc[i][j] * v_ncp[i][j];
+                m[i][j] += u_kc[i * 4 + j] * v_ncp[i][j];
             }
         }
     }
@@ -129,12 +154,22 @@ void winograd_conv(thrust::device_vector<float>& image,
     const int outH = H - 2;
     const int outW = W - 2;
     
+    // Step 1: Precompute filter transformations
+    const int threads_per_block_filter = 256;
+    int total_filters = K * C;
+    int grid_size_filter = (total_filters + threads_per_block_filter - 1) / threads_per_block_filter;
+    
+    filter_transform_kernel<<<grid_size_filter, threads_per_block_filter>>>(
+        filter.data().get(), U.data().get(), K, C
+    );
+    
+    // Step 2: Main convolution using precomputed transforms
     const int threads_per_block = 256;
     int num_tiles = N * K * (outH / 2) * (outW / 2);
     int grid_size = (num_tiles + threads_per_block - 1) / threads_per_block;
 
     winograd_conv_kernel<<<grid_size, threads_per_block>>>(
-        image.data().get(), filter.data().get(), out.data().get(),
+        image.data().get(), U.data().get(), out.data().get(),
         N, C, H, W, K, outH, outW
     );
 
