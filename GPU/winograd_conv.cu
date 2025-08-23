@@ -70,91 +70,90 @@ void winograd_conv_kernel(const float* __restrict__ image,
                           const float* __restrict__ filter,
                           float* __restrict__ output,
                           int N, int C, int H, int W, int K, int outH, int outW) {
-    // Optimized 3D thread mapping: x=tile_x, y=tile_y, z=batch*output_channel
+    // 线程映射: x=tile_x, y=tile_y, z=output_channel
     int tile_x = blockIdx.x * blockDim.x + threadIdx.x;
     int tile_y = blockIdx.y * blockDim.y + threadIdx.y;
-    int nk_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;  // 输出通道索引
     
     int tiles_x = (outW + 1) / 2;
     int tiles_y = (outH + 1) / 2;
     
-    // Check bounds
-    if (tile_x >= tiles_x || tile_y >= tiles_y || nk_idx >= N * K) return;
-    
-    // Decompose nk_idx into batch and output channel indices
-    int k = nk_idx % K;
-    int n = nk_idx / K;
+    // 检查边界
+    if (tile_x >= tiles_x || tile_y >= tiles_y || k >= K) return;
 
-    // Optimized: Use single accumulator array instead of m[4][4]
-    float accumulator[16] = {0.0f};
+    // 串行处理每个 batch
+    for (int n = 0; n < N; ++n) {
+        // 使用单个累加器数组
+        float accumulator[16] = {0.0f};
 
-    // Loop over input channels
-    for (int c = 0; c < C; ++c) {
-        // --- Load Precomputed Filter Transform ---
-        const float* u_kc = filter + (k * C + c) * 16;
-        
-        // --- Image Transform (optimized to use less registers) ---
-        int h_start = tile_y * 2;
-        int w_start = tile_x * 2;
-        
-        // Optimized: Reuse temp array for both intermediate steps
-        float temp[16];
-        
-        // Step 1: Load input data and apply B_T transform
-        // temp = B_T * d
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                temp[i * 4 + j] = 
-                    B_T[i][0] * image[(n * C + c) * H * W + (h_start + 0) * W + (w_start + j)] +
-                    B_T[i][1] * image[(n * C + c) * H * W + (h_start + 1) * W + (w_start + j)] +
-                    B_T[i][2] * image[(n * C + c) * H * W + (h_start + 2) * W + (w_start + j)] +
-                    B_T[i][3] * image[(n * C + c) * H * W + (h_start + 3) * W + (w_start + j)];
-            }
-        }
-        
-        // Step 2: Apply B transform and compute element-wise product
-        // v = temp * B, then accumulate m += u * v
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                float v_val = 
-                    temp[i * 4 + 0] * B[0][j] +
-                    temp[i * 4 + 1] * B[1][j] +
-                    temp[i * 4 + 2] * B[2][j] +
-                    temp[i * 4 + 3] * B[3][j];
-                
-                accumulator[i * 4 + j] += u_kc[i * 4 + j] * v_val;
-            }
-        }
-    }
-
-    // --- Output Transform (optimized to use minimal registers) ---
-    // Compute Y = A_T * accumulator * A
-    // Step 1: temp = A_T * accumulator
-    float temp_out[8]; // 2x4 result
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 4; ++j) {
-            temp_out[i * 4 + j] = 
-                A_T[i][0] * accumulator[0 * 4 + j] +
-                A_T[i][1] * accumulator[1 * 4 + j] +
-                A_T[i][2] * accumulator[2 * 4 + j] +
-                A_T[i][3] * accumulator[3 * 4 + j];
-        }
-    }
-    
-    // Step 2: Compute final output and write directly
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            float Y_val;
-            if (j == 0) {
-                Y_val = temp_out[i * 4 + 0] + temp_out[i * 4 + 1] + temp_out[i * 4 + 2];
-            } else {
-                Y_val = temp_out[i * 4 + 1] - temp_out[i * 4 + 2] - temp_out[i * 4 + 3];
+        // 循环处理输入通道
+        for (int c = 0; c < C; ++c) {
+            // --- 加载预计算的滤波器变换 ---
+            const float* u_kc = filter + (k * C + c) * 16;
+            
+            // --- 图像变换 ---
+            int h_start = tile_y * 2;
+            int w_start = tile_x * 2;
+            
+            // 复用临时数组进行两个中间步骤
+            float temp[16];
+            
+            // 步骤 1: 加载输入数据并应用 B_T 变换
+            // temp = B_T * d
+            for (int i = 0; i < 4; ++i) {
+                for (int j = 0; j < 4; ++j) {
+                    temp[i * 4 + j] = 
+                        B_T[i][0] * image[(n * C + c) * H * W + (h_start + 0) * W + (w_start + j)] +
+                        B_T[i][1] * image[(n * C + c) * H * W + (h_start + 1) * W + (w_start + j)] +
+                        B_T[i][2] * image[(n * C + c) * H * W + (h_start + 2) * W + (w_start + j)] +
+                        B_T[i][3] * image[(n * C + c) * H * W + (h_start + 3) * W + (w_start + j)];
+                }
             }
             
-            int h = tile_y * 2 + i;
-            int w = tile_x * 2 + j;
-            if (h < outH && w < outW) {
-                output[((n * K + k) * outH + h) * outW + w] = Y_val;
+            // 步骤 2: 应用 B 变换并计算逐元素乘积
+            // v = temp * B, 然后累加 m += u * v
+            for (int i = 0; i < 4; ++i) {
+                for (int j = 0; j < 4; ++j) {
+                    float v_val = 
+                        temp[i * 4 + 0] * B[0][j] +
+                        temp[i * 4 + 1] * B[1][j] +
+                        temp[i * 4 + 2] * B[2][j] +
+                        temp[i * 4 + 3] * B[3][j];
+                    
+                    accumulator[i * 4 + j] += u_kc[i * 4 + j] * v_val;
+                }
+            }
+        }
+
+        // --- 输出变换 ---
+        // 计算 Y = A_T * accumulator * A
+        // 步骤 1: temp = A_T * accumulator
+        float temp_out[8]; // 2x4 结果
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                temp_out[i * 4 + j] = 
+                    A_T[i][0] * accumulator[0 * 4 + j] +
+                    A_T[i][1] * accumulator[1 * 4 + j] +
+                    A_T[i][2] * accumulator[2 * 4 + j] +
+                    A_T[i][3] * accumulator[3 * 4 + j];
+            }
+        }
+        
+        // 步骤 2: 计算最终输出并直接写入
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                float Y_val;
+                if (j == 0) {
+                    Y_val = temp_out[i * 4 + 0] + temp_out[i * 4 + 1] + temp_out[i * 4 + 2];
+                } else {
+                    Y_val = temp_out[i * 4 + 1] - temp_out[i * 4 + 2] - temp_out[i * 4 + 3];
+                }
+                
+                int h = tile_y * 2 + i;
+                int w = tile_x * 2 + j;
+                if (h < outH && w < outW) {
+                    output[((n * K + k) * outH + h) * outW + w] = Y_val;
+                }
             }
         }
     }
@@ -179,20 +178,19 @@ void winograd_conv(thrust::device_vector<float>& image,
         filter.data().get(), U.data().get(), K, C
     );
     
-    // Step 2: Optimized 3D blocking for better memory access pattern
-    int tiles_x = (outW + 1) / 2;  // Number of tiles in X direction
-    int tiles_y = (outH + 1) / 2;  // Number of tiles in Y direction
-    int total_nk = N * K;          // Total batch * output_channel combinations
+    // Step 2: 优化的 3D 分块，将 Z 维度改为仅处理输出通道
+    int tiles_x = (outW + 1) / 2;  // X 方向的 tile 数量
+    int tiles_y = (outH + 1) / 2;  // Y 方向的 tile 数量
     
-    // Choose block dimensions that work well with new mapping
-    // blockDim.x = tile_x, blockDim.y = tile_y, blockDim.z = batch*output_channel
-    dim3 blockDim(8, 8, 8);  // 512 threads per block, good for occupancy
+    // 选择适合新映射的块维度
+    // blockDim.x = tile_x, blockDim.y = tile_y, blockDim.z = output_channel
+    dim3 blockDim(8, 8, 8);  // 每个块 512 个线程，有利于占用率
     
-    // Calculate grid dimensions to cover all (tile_x, tile_y, N*K) combinations
+    // 计算网格维度以覆盖所有 (tile_x, tile_y, K) 组合
     dim3 gridDim(
-        (tiles_x + blockDim.x - 1) / blockDim.x,  // Tile X dimension
-        (tiles_y + blockDim.y - 1) / blockDim.y,  // Tile Y dimension  
-        (total_nk + blockDim.z - 1) / blockDim.z  // Batch * Output channel dimension
+        (tiles_x + blockDim.x - 1) / blockDim.x,  // Tile X 维度
+        (tiles_y + blockDim.y - 1) / blockDim.y,  // Tile Y 维度  
+        (K + blockDim.z - 1) / blockDim.z         // 输出通道维度
     );
 
     winograd_conv_kernel<<<gridDim, blockDim>>>(
