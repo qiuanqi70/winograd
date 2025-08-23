@@ -70,82 +70,91 @@ void winograd_conv_kernel(const float* __restrict__ image,
                           const float* __restrict__ filter,
                           float* __restrict__ output,
                           int N, int C, int H, int W, int K, int outH, int outW) {
-    // 3D thread mapping for better memory access
-    int spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int nk_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    // Optimized 3D thread mapping: x=tile_x, y=tile_y, z=batch*output_channel
+    int tile_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int tile_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int nk_idx = blockIdx.z * blockDim.z + threadIdx.z;
     
     int tiles_x = (outW + 1) / 2;
     int tiles_y = (outH + 1) / 2;
-    int total_spatial_tiles = tiles_x * tiles_y;
     
     // Check bounds
-    if (spatial_idx >= total_spatial_tiles || nk_idx >= N * K) return;
+    if (tile_x >= tiles_x || tile_y >= tiles_y || nk_idx >= N * K) return;
     
-    // Decompose indices
-    int tile_y = spatial_idx / tiles_x;
-    int tile_x = spatial_idx % tiles_x;
+    // Decompose nk_idx into batch and output channel indices
     int k = nk_idx % K;
     int n = nk_idx / K;
 
-    float m[4][4] = {{0.0f}};
+    // Optimized: Use single accumulator array instead of m[4][4]
+    float accumulator[16] = {0.0f};
 
     // Loop over input channels
     for (int c = 0; c < C; ++c) {
         // --- Load Precomputed Filter Transform ---
-        // Note: filter parameter now points to precomputed U matrix
-        // U[k][c]
         const float* u_kc = filter + (k * C + c) * 16;
         
-        // --- Image Transform ---
+        // --- Image Transform (optimized to use less registers) ---
         int h_start = tile_y * 2;
         int w_start = tile_x * 2;
-        float d[4][4];
+        
+        // Optimized: Reuse temp array for both intermediate steps
+        float temp[16];
+        
+        // Step 1: Load input data and apply B_T transform
+        // temp = B_T * d
         for (int i = 0; i < 4; ++i) {
             for (int j = 0; j < 4; ++j) {
-                d[i][j] = image[(n * C + c) * H * W + (h_start + i) * W + (w_start + j)];
+                temp[i * 4 + j] = 
+                    B_T[i][0] * image[(n * C + c) * H * W + (h_start + 0) * W + (w_start + j)] +
+                    B_T[i][1] * image[(n * C + c) * H * W + (h_start + 1) * W + (w_start + j)] +
+                    B_T[i][2] * image[(n * C + c) * H * W + (h_start + 2) * W + (w_start + j)] +
+                    B_T[i][3] * image[(n * C + c) * H * W + (h_start + 3) * W + (w_start + j)];
             }
         }
-        float v_ncp[4][4];
-        float temp_d[4][4];
+        
+        // Step 2: Apply B transform and compute element-wise product
+        // v = temp * B, then accumulate m += u * v
         for (int i = 0; i < 4; ++i) {
             for (int j = 0; j < 4; ++j) {
-                temp_d[i][j] = B_T[i][0] * d[0][j] + B_T[i][1] * d[1][j] + B_T[i][2] * d[2][j] + B_T[i][3] * d[3][j];
-            }
-        }
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                v_ncp[i][j] = temp_d[i][0] * B[0][j] + temp_d[i][1] * B[1][j] + temp_d[i][2] * B[2][j] + temp_d[i][3] * B[3][j];
-            }
-        }
-
-        // --- Element-wise product and accumulate ---
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                m[i][j] += u_kc[i * 4 + j] * v_ncp[i][j];
+                float v_val = 
+                    temp[i * 4 + 0] * B[0][j] +
+                    temp[i * 4 + 1] * B[1][j] +
+                    temp[i * 4 + 2] * B[2][j] +
+                    temp[i * 4 + 3] * B[3][j];
+                
+                accumulator[i * 4 + j] += u_kc[i * 4 + j] * v_val;
             }
         }
     }
 
-    // --- Output Transform ---
-    float temp_m[2][4];
+    // --- Output Transform (optimized to use minimal registers) ---
+    // Compute Y = A_T * accumulator * A
+    // Step 1: temp = A_T * accumulator
+    float temp_out[8]; // 2x4 result
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 4; ++j) {
-            temp_m[i][j] = A_T[i][0] * m[0][j] + A_T[i][1] * m[1][j] + A_T[i][2] * m[2][j] + A_T[i][3] * m[3][j];
+            temp_out[i * 4 + j] = 
+                A_T[i][0] * accumulator[0 * 4 + j] +
+                A_T[i][1] * accumulator[1 * 4 + j] +
+                A_T[i][2] * accumulator[2 * 4 + j] +
+                A_T[i][3] * accumulator[3 * 4 + j];
         }
     }
-    float Y[2][2];
-    for (int i = 0; i < 2; ++i) {
-        Y[i][0] = temp_m[i][0] + temp_m[i][1] + temp_m[i][2];
-        Y[i][1] = temp_m[i][1] - temp_m[i][2] - temp_m[i][3];
-    }
-
-    // --- Write output ---
+    
+    // Step 2: Compute final output and write directly
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 2; ++j) {
+            float Y_val;
+            if (j == 0) {
+                Y_val = temp_out[i * 4 + 0] + temp_out[i * 4 + 1] + temp_out[i * 4 + 2];
+            } else {
+                Y_val = temp_out[i * 4 + 1] - temp_out[i * 4 + 2] - temp_out[i * 4 + 3];
+            }
+            
             int h = tile_y * 2 + i;
             int w = tile_x * 2 + j;
             if (h < outH && w < outW) {
-                output[((n * K + k) * outH + h) * outW + w] = Y[i][j];
+                output[((n * K + k) * outH + h) * outW + w] = Y_val;
             }
         }
     }
@@ -170,21 +179,20 @@ void winograd_conv(thrust::device_vector<float>& image,
         filter.data().get(), U.data().get(), K, C
     );
     
-    // Step 2: 3D blocking for better memory access pattern
+    // Step 2: Optimized 3D blocking for better memory access pattern
     int tiles_x = (outW + 1) / 2;  // Number of tiles in X direction
     int tiles_y = (outH + 1) / 2;  // Number of tiles in Y direction
+    int total_nk = N * K;          // Total batch * output_channel combinations
     
-    // Choose block dimensions that work well with tile distribution
-    dim3 blockDim(16, 16, 1);  // 256 threads per block
+    // Choose block dimensions that work well with new mapping
+    // blockDim.x = tile_x, blockDim.y = tile_y, blockDim.z = batch*output_channel
+    dim3 blockDim(8, 8, 8);  // 512 threads per block, good for occupancy
     
-    // Calculate grid dimensions to cover all (N, K, tile_y, tile_x) combinations
-    int total_spatial_tiles = tiles_x * tiles_y;
-    int total_nk = N * K;
-    
+    // Calculate grid dimensions to cover all (tile_x, tile_y, N*K) combinations
     dim3 gridDim(
-        (total_spatial_tiles + blockDim.x - 1) / blockDim.x,  // Spatial tiles dimension
-        (total_nk + blockDim.y - 1) / blockDim.y,             // N*K dimension  
-        1
+        (tiles_x + blockDim.x - 1) / blockDim.x,  // Tile X dimension
+        (tiles_y + blockDim.y - 1) / blockDim.y,  // Tile Y dimension  
+        (total_nk + blockDim.z - 1) / blockDim.z  // Batch * Output channel dimension
     );
 
     winograd_conv_kernel<<<gridDim, blockDim>>>(
