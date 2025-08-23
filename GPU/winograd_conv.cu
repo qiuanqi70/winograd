@@ -70,16 +70,22 @@ void winograd_conv_kernel(const float* __restrict__ image,
                           const float* __restrict__ filter,
                           float* __restrict__ output,
                           int N, int C, int H, int W, int K, int outH, int outW) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int num_tiles = N * K * (outH / 2) * (outW / 2);
-    if (idx >= num_tiles) return;
-
-    // Decompose thread index to get (n, k, tile_y, tile_x)
-    int p_local = idx % ((outH / 2) * (outW / 2));
-    int k = (idx / ((outH / 2) * (outW / 2))) % K;
-    int n = idx / (K * (outH / 2) * (outW / 2));
-    int tile_y = p_local / (outW / 2);
-    int tile_x = p_local % (outW / 2);
+    // 3D thread mapping for better memory access
+    int spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int nk_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    int tiles_x = (outW + 1) / 2;
+    int tiles_y = (outH + 1) / 2;
+    int total_spatial_tiles = tiles_x * tiles_y;
+    
+    // Check bounds
+    if (spatial_idx >= total_spatial_tiles || nk_idx >= N * K) return;
+    
+    // Decompose indices
+    int tile_y = spatial_idx / tiles_x;
+    int tile_x = spatial_idx % tiles_x;
+    int k = nk_idx % K;
+    int n = nk_idx / K;
 
     float m[4][4] = {{0.0f}};
 
@@ -87,6 +93,7 @@ void winograd_conv_kernel(const float* __restrict__ image,
     for (int c = 0; c < C; ++c) {
         // --- Load Precomputed Filter Transform ---
         // Note: filter parameter now points to precomputed U matrix
+        // U[k][c]
         const float* u_kc = filter + (k * C + c) * 16;
         
         // --- Image Transform ---
@@ -163,12 +170,24 @@ void winograd_conv(thrust::device_vector<float>& image,
         filter.data().get(), U.data().get(), K, C
     );
     
-    // Step 2: Main convolution using precomputed transforms
-    const int threads_per_block = 256;
-    int num_tiles = N * K * (outH / 2) * (outW / 2);
-    int grid_size = (num_tiles + threads_per_block - 1) / threads_per_block;
+    // Step 2: 3D blocking for better memory access pattern
+    int tiles_x = (outW + 1) / 2;  // Number of tiles in X direction
+    int tiles_y = (outH + 1) / 2;  // Number of tiles in Y direction
+    
+    // Choose block dimensions that work well with tile distribution
+    dim3 blockDim(16, 16, 1);  // 256 threads per block
+    
+    // Calculate grid dimensions to cover all (N, K, tile_y, tile_x) combinations
+    int total_spatial_tiles = tiles_x * tiles_y;
+    int total_nk = N * K;
+    
+    dim3 gridDim(
+        (total_spatial_tiles + blockDim.x - 1) / blockDim.x,  // Spatial tiles dimension
+        (total_nk + blockDim.y - 1) / blockDim.y,             // N*K dimension  
+        1
+    );
 
-    winograd_conv_kernel<<<grid_size, threads_per_block>>>(
+    winograd_conv_kernel<<<gridDim, blockDim>>>(
         image.data().get(), U.data().get(), out.data().get(),
         N, C, H, W, K, outH, outW
     );
