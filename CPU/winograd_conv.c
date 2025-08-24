@@ -37,21 +37,6 @@ const float A_T[2][4] = {
     {0, 1, -1, -1}
 };
 
-void sgemm(const float* A, const float* B, float* out, 
-           const int M, const int K, const int N) {
-    for (int i = 0; i < M * N; ++i) {
-        out[i] = 0.0f;
-    }
-
-    for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
-            for (int k = 0; k < K; ++k) {
-                out[i * N + j] += A[i * K + k] * B[k * N + j];
-            }
-        }
-    }
-}
-
 void sgemm_neon(const float* A, const float* B, float* out, int M, int K, int N) {
     int j;
     #pragma omp parallel for
@@ -100,86 +85,96 @@ void winograd_conv(const float* restrict image, const float* restrict filter, fl
     const int sizeO = outHeight * outWidth; // size of output
     const int P = outHeight / 2 * outWidth / 2 * N; // size of output in blocks
 
-    float tmp_u[12]; // 4 * 3
-    float u[16];     // 4 * 4;
-    
-    // Transform filters and scatter to U
-    // U[:, :, k, c] = G * filters[k, c, :, :] * G^T
-    #pragma omp parallel for private(tmp_u, u)
-    for (int k = 0; k < K; ++k) {
-        for (int c = 0; c < C; ++c) {
-            const float* filters_ptr = filter + (k * C + c) * sizeF;
+    //将filter变换和image变换改为任务并行
+    #pragma omp parallel sections
+    {
+        #pragma omp section
+        {
+            float tmp_u[12]; // 4 * 3
+            float u[16];     // 4 * 4;
             
-            for(int i=0;i<3;i++){
-                tmp_u[i]=filters_ptr[i];
-                tmp_u[3+i]=0.5*(filters_ptr[i]+filters_ptr[3+i]+filters_ptr[3*2+i]);
-                tmp_u[3*2+i]=0.5*(filters_ptr[i]-filters_ptr[3+i]+filters_ptr[3*2+i]);
-                tmp_u[3*3+i]=filters_ptr[2*3+i];
-            }
-            for(int i=0;i<4;i++){
-                u[4*i]=tmp_u[3*i];
-                u[4*i+1]=0.5*(tmp_u[3*i]+tmp_u[3*i+1]+tmp_u[3*i+2]);
-                u[4*i+2]=0.5*(tmp_u[3*i]-tmp_u[3*i+1]+tmp_u[3*i+2]);
-                u[4*i+3]=tmp_u[3*i+2];
-            }
-            
-            for (int xi = 0; xi < 4; ++xi) {
-                for (int nu = 0; nu < 4; ++nu) {
-                    U[((xi * 4 + nu) * K + k) * C + c] = u[xi * 4 + nu];
+            // Transform filters and scatter to U
+            // U[:, :, k, c] = G * filters[k, c, :, :] * G^T
+            #pragma omp parallel for private(tmp_u, u)
+            for (int k = 0; k < K; ++k) {
+                for (int c = 0; c < C; ++c) {
+                    const float* filters_ptr = filter + (k * C + c) * sizeF;
+                    
+                    for(int i=0;i<3;i++){
+                        tmp_u[i]=filters_ptr[i];
+                        tmp_u[3+i]=0.5*(filters_ptr[i]+filters_ptr[3+i]+filters_ptr[3*2+i]);
+                        tmp_u[3*2+i]=0.5*(filters_ptr[i]-filters_ptr[3+i]+filters_ptr[3*2+i]);
+                        tmp_u[3*3+i]=filters_ptr[2*3+i];
+                    }
+                    for(int i=0;i<4;i++){
+                        u[4*i]=tmp_u[3*i];
+                        u[4*i+1]=0.5*(tmp_u[3*i]+tmp_u[3*i+1]+tmp_u[3*i+2]);
+                        u[4*i+2]=0.5*(tmp_u[3*i]-tmp_u[3*i+1]+tmp_u[3*i+2]);
+                        u[4*i+3]=tmp_u[3*i+2];
+                    }
+                    
+                    for (int xi = 0; xi < 4; ++xi) {
+                        for (int nu = 0; nu < 4; ++nu) {
+                            U[((xi * 4 + nu) * K + k) * C + c] = u[xi * 4 + nu];
+                        }
+                    }
                 }
             }
         }
-    }
+        #pragma omp section
+        {
+            // Transform image and scatter to V
+            // V[:, :, c, p] = B^T * image[c, b, :, :] * B
+            float tmp_v[16];
+            float d[16]; // d: [4 * 4];
+            float v[16]; // v: [4 * 4];
+            #pragma omp parallel for collapse(2) private(tmp_v, d, v)
+            for (int n = 0; n < N; ++n) {
+                for (int c = 0; c < C; ++c) {
+                    for (int y = 0; y < outHeight / 2; ++y) {
+                        for (int x = 0; x < outWidth / 2; ++x) {
+                            // Generate d_cb
+                            for (int iy = 0; iy < 4; ++iy) {
+                                for (int ix = 0; ix < 4; ++ix) {
+                                    d[iy * 4 + ix] = image[(n * C + c) * sizeI +
+                                                        (y * 2 + iy) * inWidth + (x * 2 + ix)];
+                                }
+                            }
 
-    // Transform image and scatter to V
-    // V[:, :, c, p] = B^T * image[c, b, :, :] * B
-    float tmp_v[16];
-    float d[16]; // d: [4 * 4];
-    float v[16]; // v: [4 * 4];
-    #pragma omp parallel for collapse(2) private(tmp_v, d, v)
-    for (int n = 0; n < N; ++n) {
-        for (int c = 0; c < C; ++c) {
-            for (int y = 0; y < outHeight / 2; ++y) {
-                for (int x = 0; x < outWidth / 2; ++x) {
-                    // Generate d_cb
-                    for (int iy = 0; iy < 4; ++iy) {
-                        for (int ix = 0; ix < 4; ++ix) {
-                            d[iy * 4 + ix] = image[(n * C + c) * sizeI +
-                                                (y * 2 + iy) * inWidth + (x * 2 + ix)];
+                            for(int i=0;i<4;i++){
+                                tmp_v[i]=d[i]-d[4*2+i];
+                                tmp_v[4+i]=d[4+i]+d[4*2+i];
+                                tmp_v[4*2+i]=-d[4+i]+d[4*2+i];
+                                tmp_v[4*3+i]=d[4+i]-d[4*3+i];
+                            }
+                            for(int i=0;i<4;i++){
+                                v[4*i]=tmp_v[4*i]-tmp_v[4*i+2];
+                                v[4*i+1]=tmp_v[4*i+1]+tmp_v[4*i+2];
+                                v[4*i+2]=-tmp_v[4*i+1]+tmp_v[4*i+2];
+                                v[4*i+3]=tmp_v[4*i+1]-tmp_v[4*i+3];
+                            }
+                            
+                            int b = ((n * outHeight / 2) + y) * outWidth / 2 + x;
+                            for (int xi = 0; xi < 4; ++xi) {
+                                for (int nu = 0; nu < 4; ++nu) {
+                                    V[((xi * 4 + nu) * C + c) * P + b] = v[xi * 4 + nu];
+                                }
+                            }
                         }
-                    }
-
-                    for(int i=0;i<4;i++){
-                        tmp_v[i]=d[i]-d[4*2+i];
-                        tmp_v[4+i]=d[4+i]+d[4*2+i];
-                        tmp_v[4*2+i]=-d[4+i]+d[4*2+i];
-                        tmp_v[4*3+i]=d[4+i]-d[4*3+i];
-                    }
-                    for(int i=0;i<4;i++){
-                        v[4*i]=tmp_v[4*i]-tmp_v[4*i+2];
-                        v[4*i+1]=tmp_v[4*i+1]+tmp_v[4*i+2];
-                        v[4*i+2]=-tmp_v[4*i+1]+tmp_v[4*i+2];
-                        v[4*i+3]=tmp_v[4*i+1]-tmp_v[4*i+3];
-                    }
-                    
-                    int b = ((n * outHeight / 2) + y) * outWidth / 2 + x;
-                    for (int xi = 0; xi < 4; ++xi) {
-                        for (int nu = 0; nu < 4; ++nu) {
-                            V[((xi * 4 + nu) * C + c) * P + b] = v[xi * 4 + nu];
-                        }
-                    }
+                    }    
                 }
-            }    
+            }
         }
     }
 
     // M[xi, nu, :, :] = U[xi, nu, :, :] * V[xi, nu, :, :]
+    #pragma omp parallel for collapse(2) schedule(dynamic)
     for (int xi = 0; xi < 4; ++xi) {
         for (int nu = 0; nu < 4; ++nu) {
             float* M_ptr = M + (xi * 4 + nu) * K * P;
             float* U_ptr = U + (xi * 4 + nu) * K * C;
             float* V_ptr = V + (xi * 4 + nu) * C * P;
-            sgemm_parallel(U_ptr, V_ptr, M_ptr, K, C, P);
+            sgemm_neon(U_ptr, V_ptr, M_ptr, K, C, P);
         }
     }
 
