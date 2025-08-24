@@ -281,7 +281,7 @@ void winograd_conv(thrust::device_vector<float>& image,
     
     // 选择适合新映射的块维度
     // blockDim.x = tile_x, blockDim.y = tile_y, blockDim.z = output_channel
-    dim3 blockDim(8, 8, 8);  // 每个块 512 个线程，有利于占用率
+    dim3 blockDim(4, 4, 16);  // 每个块 512 个线程，有利于占用率
     
     // 计算网格维度以覆盖所有 (tile_x, tile_y, K) 组合
     dim3 gridDim(
