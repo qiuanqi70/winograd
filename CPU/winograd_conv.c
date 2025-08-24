@@ -1,4 +1,6 @@
 #include "winograd.h"
+#include <arm_neon.h>
+#include <omp.h>
 
 // Transformation matrices for Winograd F(2x2, 3x3)
 const float G[4][3] = {
@@ -50,18 +52,26 @@ void sgemm(const float* A, const float* B, float* out,
     }
 }
 
-void sgemm_parallel(const float* A, const float* B, float* out,
-                    const int M, const int K, const int N) {
-    for (int i = 0; i < M * N; ++i) {
-        out[i] = 0.0f;
-    }
-
-    #pragma omp parallel for collapse(2)
+void sgemm_neon(const float* A, const float* B, float* out, int M, int K, int N) {
+    int j;
+    #pragma omp parallel for
     for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
+        for(j = 0; j < N; j+=4) {
+            float32x4_t acc = vdupq_n_f32(0.0f);
             for (int k = 0; k < K; ++k) {
-                out[i * N + j] += A[i * K + k] * B[k * N + j];
+                float32x4_t b_vec = vld1q_f32(B + k * N +j); // 加载B的4个元素
+                float32x4_t a_val = vdupq_n_f32(A[i * K + k]); // A的一个元素广播
+                acc = vmlaq_f32(acc, a_val, b_vec); // acc += a_val * b_vec
             }
+            vst1q_f32(out + i * N + j, acc); // 存回结果
+        }
+
+        #pragma omp parallel for
+        for (int jj = j; jj < N; ++jj) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k)
+                sum += A[i * K + k] * B[k * N + jj];
+            out[i * N + jj] = sum;
         }
     }
 }
@@ -98,7 +108,7 @@ void winograd_conv(const float* restrict image, const float* restrict filter, fl
     #pragma omp parallel for private(tmp_u, u)
     for (int k = 0; k < K; ++k) {
         for (int c = 0; c < C; ++c) {
-            float* filters_ptr = filter + (k * C + c) * sizeF;
+            const float* filters_ptr = filter + (k * C + c) * sizeF;
             sgemm(&G[0][0], filters_ptr, tmp_u, 4, 3, 3);
             sgemm(tmp_u, &G_T[0][0], u, 4, 3, 4);
             
