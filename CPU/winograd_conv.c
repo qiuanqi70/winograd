@@ -109,8 +109,19 @@ void winograd_conv(const float* restrict image, const float* restrict filter, fl
     for (int k = 0; k < K; ++k) {
         for (int c = 0; c < C; ++c) {
             const float* filters_ptr = filter + (k * C + c) * sizeF;
-            sgemm(&G[0][0], filters_ptr, tmp_u, 4, 3, 3);
-            sgemm(tmp_u, &G_T[0][0], u, 4, 3, 4);
+            
+            for(int i=0;i<3;i++){
+                tmp_u[i]=filters_ptr[i];
+                tmp_u[3+i]=0.5*(filters_ptr[i]+filters_ptr[3+i]+filters_ptr[3*2+i]);
+                tmp_u[3*2+i]=0.5*(filters_ptr[i]-filters_ptr[3+i]+filters_ptr[3*2+i]);
+                tmp_u[3*3+i]=filters_ptr[2*3+i];
+            }
+            for(int i=0;i<4;i++){
+                u[4*i]=tmp_u[3*i];
+                u[4*i+1]=0.5*(tmp_u[3*i]+tmp_u[3*i+1]+tmp_u[3*i+2]);
+                u[4*i+2]=0.5*(tmp_u[3*i]-tmp_u[3*i+1]+tmp_u[3*i+2]);
+                u[4*i+3]=tmp_u[3*i+2];
+            }
             
             for (int xi = 0; xi < 4; ++xi) {
                 for (int nu = 0; nu < 4; ++nu) {
@@ -137,8 +148,19 @@ void winograd_conv(const float* restrict image, const float* restrict filter, fl
                                                 (y * 2 + iy) * inWidth + (x * 2 + ix)];
                         }
                     }
-                    sgemm(&B_T[0][0], d, tmp_v, 4, 4, 4);
-                    sgemm(tmp_v, &B[0][0], v, 4, 4, 4);
+
+                    for(int i=0;i<4;i++){
+                        tmp_v[i]=d[i]-d[4*2+i];
+                        tmp_v[4+i]=d[4+i]+d[4*2+i];
+                        tmp_v[4*2+i]=-d[4+i]+d[4*2+i];
+                        tmp_v[4*3+i]=d[4+i]-d[4*3+i];
+                    }
+                    for(int i=0;i<4;i++){
+                        v[4*i]=tmp_v[4*i]-tmp_v[4*i+2];
+                        v[4*i+1]=tmp_v[4*i+1]+tmp_v[4*i+2];
+                        v[4*i+2]=-tmp_v[4*i+1]+tmp_v[4*i+2];
+                        v[4*i+3]=tmp_v[4*i+1]-tmp_v[4*i+3];
+                    }
                     
                     int b = ((n * outHeight / 2) + y) * outWidth / 2 + x;
                     for (int xi = 0; xi < 4; ++xi) {
@@ -177,8 +199,15 @@ void winograd_conv(const float* restrict image, const float* restrict filter, fl
                             mm[xi * 4 + nu] = M[((xi * 4 + nu) * K + k) * P + b];
                         }
                     }
-                    sgemm(&A_T[0][0], mm, tmp_m, 2, 4, 4);
-                    sgemm(tmp_m, &A[0][0], temp_out, 2, 4, 2);
+                    
+                    for(int i=0;i<4;i++){
+                        tmp_m[i]=mm[i]+mm[4+i]+mm[4*2+i];
+                        tmp_m[4+i]=mm[4+i]-mm[4*2+i]-mm[4*3+i];
+                    }
+                    for(int i=0;i<2;i++){
+                        temp_out[i*2]=tmp_m[4*i]+tmp_m[4*i+1]+tmp_m[4*i+2];
+                        temp_out[2*i+1]=tmp_m[4*i+1]-tmp_m[4*i+2]-tmp_m[4*i+3];
+                    }
                     
                     for (int i = 0; i < 2; ++i) {
                         for (int j = 0; j < 2; ++j) {
