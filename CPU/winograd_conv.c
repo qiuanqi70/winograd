@@ -50,7 +50,7 @@ void sgemm_neon(const float* A, const float* B, float* out, int M, int K, int N)
             }
             vst1q_f32(out + i * N + j, acc); // 存回结果
         }
-
+        //尾处理
         #pragma omp parallel for
         for (int jj = j; jj < N; ++jj) {
             float sum = 0.0f;
@@ -135,10 +135,10 @@ void winograd_conv(const float* restrict image, const float* restrict filter, fl
                         for (int x = 0; x < outWidth / 2; ++x) {
                             // Generate d_cb
                             for (int iy = 0; iy < 4; ++iy) {
-                                for (int ix = 0; ix < 4; ++ix) {
-                                    d[iy * 4 + ix] = image[(n * C + c) * sizeI +
-                                                        (y * 2 + iy) * inWidth + (x * 2 + ix)];
-                                }
+                                // 使用NEON加载4个连续的float值
+                                float32x4_t vec = vld1q_f32(image + (n * C + c) * sizeI + (y * 2 + iy) * inWidth + (x * 2));
+                                // 将向量数据存储到目标数组
+                                vst1q_f32(d + iy * 4, vec);
                             }
 
                             for(int i=0;i<4;i++){
